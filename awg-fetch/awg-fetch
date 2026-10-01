@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+
+CODE_FILE = Path.home() / ".config" / "awgproxy" / "code"
+
+
+def _load_code() -> str:
+    env = os.environ.get("AWG_FETCH_CODE")
+    if env:
+        return env.strip()
+    if CODE_FILE.exists():
+        return CODE_FILE.read_text().strip()
+    sys.exit(
+        f"No hide.mn account code found. Set AWG_FETCH_CODE or write it to {CODE_FILE}"
+    )
+
+
+class WireGuardUpdater:
+    CONFIG_DIR = Path.home() / ".config" / "awgproxy" / "configs"
+    BACKUP_DIR = Path.home() / ".config" / "awgproxy" / "backups"
+
+    def __init__(self, url: str, code: str):
+        self.url = url.strip().rstrip("/")
+        self.code = code
+        self.servers = {}
+
+    def _post(self, path: str, data: dict, timeout: int = 15) -> bytes:
+        payload = urllib.parse.urlencode(data).encode()
+        req = urllib.request.Request(
+            f"https://{self.url}{path}",
+            data=payload,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                "Accept": "*/*",
+                "Accept-Language": "en",
+                "Origin": f"https://{self.url}",
+                "Referer": f"https://{self.url}/en/faq/vpn/",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+
+    def update(self) -> bool:
+        print("Fetching server list...")
+        self._fetch_servers()
+        print(f"Found {len(self.servers)} servers")
+
+        jobs = self._prepare_jobs()
+        if not jobs:
+            print("No jobs prepared")
+            return False
+
+        self.CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = Path(tempfile.mkdtemp(prefix="vpn_configs_tmp_", dir=self.CONFIG_DIR.parent))
+        try:
+            ok = self._fetch_all_configs(jobs, tmp_path)
+            if not ok:
+                shutil.rmtree(tmp_path, ignore_errors=True)
+                print("No configs fetched")
+                return False
+
+            self._backup_current()
+            self._atomic_swap(tmp_path)
+        except Exception:
+            shutil.rmtree(tmp_path, ignore_errors=True)
+            raise
+
+        print("Update completed successfully")
+        return True
+
+    def _fetch_servers(self):
+        raw = self._post("/api/serverlist.php?out=js&wg", {"code": self.code})
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("latin-1")
+        self.servers = json.loads(text)
+        if not isinstance(self.servers, dict):
+            raise RuntimeError("Unexpected server list format")
+
+    def _prepare_jobs(self):
+        counters = {}
+        jobs = []
+
+        for server_id in sorted(self.servers.keys()):
+            info = self.servers[server_id]
+            wg = info["services"].get("wg")
+            if wg is None:
+                continue
+            code = info["country_code"].lower()
+            wg_ip = wg["ip"]
+
+            counters.setdefault(code, -1)
+            counters[code] += 1
+            jobs.append((wg_ip, f"{code}{counters[code]}.conf"))
+
+        return jobs
+
+    def _fetch_all_configs(self, jobs, temp_dir: Path) -> bool:
+        success = 0
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(self._fetch_single_config, wg_ip, filename, temp_dir)
+                for wg_ip, filename in jobs
+            ]
+            for f in as_completed(futures):
+                if f.result():
+                    success += 1
+
+        print(f"Fetched {success}/{len(jobs)} configs")
+        return success > 0
+
+    def _fetch_single_config(self, wg_ip: str, filename: str, temp_dir: Path) -> bool:
+        try:
+            raw = self._post(
+                "/api/vpn_get_config_wg.php",
+                {"code": self.code, "server": wg_ip, "awg": 1},
+            )
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw.decode("latin-1")
+
+            (temp_dir / filename).write_text(text)
+            print(f"  → {filename}")
+            time.sleep(0.5)
+            return True
+        except Exception as e:
+            print(f"Failed {wg_ip}: {e}")
+            return False
+
+    def _backup_current(self):
+        if not self.CONFIG_DIR.exists():
+            return
+        if not any(self.CONFIG_DIR.glob("*.conf")):
+            return
+
+        self.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = self.BACKUP_DIR / f"vpn_configs_{ts}"
+        shutil.copytree(self.CONFIG_DIR, backup)
+        print(f"Backup created: {backup.name}")
+
+    def _atomic_swap(self, temp_dir: Path):
+        old = None
+        if self.CONFIG_DIR.exists():
+            old = self.CONFIG_DIR.with_name(self.CONFIG_DIR.name + "_old")
+            if old.exists():
+                shutil.rmtree(old)
+            self.CONFIG_DIR.rename(old)
+
+        temp_dir.rename(self.CONFIG_DIR)
+
+        if old and old.exists():
+            shutil.rmtree(old)
+
+        print("Atomic swap completed")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Fetch WireGuard/AmneziaWG configs from hide.mn")
+    parser.add_argument("host", nargs="?", default="hide.mn")
+    args = parser.parse_args()
+
+    code = _load_code()
+    sys.exit(0 if WireGuardUpdater(args.host, code).update() else 1)
+
+
+if __name__ == "__main__":
+    main()

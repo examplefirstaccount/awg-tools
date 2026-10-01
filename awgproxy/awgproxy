@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/awgproxy/configs"
+RELAY="$HOME/.local/libexec/awgproxy/relay"
+
+cfg=""
+relay_conf=""
+relay_pid=""
+wp_pid=""
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+usage() {
+    cat <<EOF
+Usage:
+  awgproxy <config> [--socks5] [--port N] [--bypass]
+  awgproxy list
+
+  --bypass   route through the BPF relay (needs sudo) to get underneath
+             socket-layer VPN filters like Cisco AnyConnect. Without it,
+             awgproxy is a plain wireproxy wrapper — no root needed.
+EOF
+}
+
+_physical_iface() {
+    netstat -rn -f inet 2>/dev/null | grep "^default" | grep -v "utun" | awk '{print $NF}' | head -1
+}
+
+cmd_list() {
+    [[ -d "$CONFIG_DIR" ]] || die "No configs dir: $CONFIG_DIR"
+    local files=("$CONFIG_DIR"/*.conf)
+    [[ -e "${files[0]}" ]] || die "No configs found in $CONFIG_DIR"
+
+    local cols=8 i=0
+    for f in "${files[@]}"; do
+        printf "%-8s" "$(basename "$f" .conf)"
+        i=$(( i + 1 ))
+        [[ $(( i % cols )) -eq 0 ]] && echo || true
+    done
+    [[ $(( i % cols )) -ne 0 ]] && echo || true
+}
+
+cmd_run() {
+    require_cmd wireproxy
+
+    local iface="" proto="http" port="25345" bypass=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --socks5) proto="socks5"; shift ;;
+            --port) port="${2:?--port requires a value}"; shift 2 ;;
+            --bypass) bypass=1; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *) iface="$1"; shift ;;
+        esac
+    done
+
+    [[ -n "$iface" ]] || { usage; exit 1; }
+    [[ -f "$CONFIG_DIR/$iface.conf" ]] || die "Config not found: $CONFIG_DIR/$iface.conf"
+
+    cfg="/tmp/awgproxy_$$.conf"
+    trap '
+        if [[ -n "${wp_pid:-}" ]]; then
+            kill "${wp_pid}" 2>/dev/null || true
+        fi
+        if [[ -n "${relay_pid:-}" ]]; then
+            kill -- -"${relay_pid}" 2>/dev/null || kill "${relay_pid}" 2>/dev/null || true
+        fi
+        [[ -n "${cfg:-}"        ]] && rm -f "$cfg"
+        [[ -n "${relay_conf:-}" ]] && rm -f "$relay_conf"
+    ' EXIT
+
+    local wg_config="$CONFIG_DIR/$iface.conf"
+
+    if [[ "$bypass" -eq 1 ]]; then
+        [[ -x "$RELAY" ]] || die "Relay binary not found: $RELAY (reinstall with install.sh)"
+
+        local endpoint_raw awg_host awg_port
+        endpoint_raw=$(grep "^Endpoint" "$wg_config" | sed 's/.*= *//')
+        awg_host=$(echo "$endpoint_raw" | cut -d: -f1)
+        awg_port=$(echo "$endpoint_raw" | cut -d: -f2)
+
+        local phys_if
+        phys_if=$(_physical_iface)
+        [[ -n "$phys_if" ]] || die "Could not detect a physical interface for --bypass"
+
+        local relay_port=$(( port + 1000 ))
+
+        sudo "$RELAY" "$relay_port" "$awg_host" "$awg_port" "$phys_if" &
+        relay_pid=$!
+        sleep 0.3
+
+        relay_conf="/tmp/awgproxy_relay_$$.conf"
+        sed -e "s/^Endpoint = .*/Endpoint = 127.0.0.1:${relay_port}/" \
+            "$wg_config" > "$relay_conf"
+        wg_config="$relay_conf"
+
+        echo "Bypass relay: 127.0.0.1:${relay_port} -> ${awg_host}:${awg_port} (via ${phys_if})"
+    fi
+
+    cat > "$cfg" <<EOF
+WGConfig = $wg_config
+
+[$proto]
+BindAddress = 127.0.0.1:$port
+EOF
+
+    echo "Starting wireproxy for $iface -> $proto://127.0.0.1:$port (Ctrl+C to stop)"
+    wireproxy -c "$cfg" 2>&1 &
+    wp_pid=$!
+    wait "$wp_pid"
+}
+
+case "${1:-}" in
+    list)
+        cmd_list
+        ;;
+    "" | -h | --help)
+        usage
+        exit 1
+        ;;
+    *)
+        cmd_run "$@"
+        ;;
+esac
